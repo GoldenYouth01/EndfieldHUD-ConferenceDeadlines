@@ -1,0 +1,806 @@
+diff --git a/windows/app/application.cpp b/windows/app/application.cpp
+index c97f8f9..b06a9fe 100644
+--- a/windows/app/application.cpp
++++ b/windows/app/application.cpp
+@@ -407,7 +407,7 @@ tools::DesignOwnerOptions Application::Impl::designOwnerOptions(std::string name
+ void Application::Impl::setDesignScreen(core::Module module){if(notes)notes->setDesignScreen(module,true);}
+ void Application::Impl::markDesignScreens(const ModuleOwner&owner){
+     if(!dynamic_cast<const tools::DesignModuleOwner*>(&owner))return;
+-    for(unsigned n=0;n<=static_cast<unsigned>(core::Module::profile);++n){const auto module=static_cast<core::Module>(n);if(owner.presents(module))setDesignScreen(module);}
++    for(unsigned n=0;n<core::moduleCount;++n){const auto module=static_cast<core::Module>(n);if(owner.presents(module))setDesignScreen(module);}
+ }
+ // Startup trace openings: the frame stages (LiveProbe) of each traced opening
+ // are recorded with it, unless live diagnostics own the probe.
+@@ -989,6 +989,7 @@ std::optional<core::Module> Application::Impl::AreaHost::hoveredModule()const no
+     if(!impl_.session||!impl_.contentCatalog)return std::nullopt;
+     const auto hovered=impl_.session->hovered();if(!hovered)return std::nullopt;
+     const auto&actions=impl_.session->actions();const auto action=actions.find(*hovered);if(action==actions.end())return std::nullopt;
++    if(const auto*entry=impl_.navigationEntry(action->second))return entry->module?core::moduleNamed(entry->target):std::nullopt;
+     for(const auto&e:impl_.contentCatalog->entries())if(e.action==action->second)return core::moduleNamed(e.target);
+     return std::nullopt;
+ }
+@@ -2468,7 +2469,7 @@ const WatchSessionFrame* Application::Impl::poseShell(double time){
+     if(arrangeMarks&&designOverlay){const auto marks=labels->marks();arrangeMarkRects.clear();
+         for(const auto&mark:marks)arrangeMarkRects.push_back(modules::design::ArchiveTile::arrangeMarkRects({0,0,mark.size[0],mark.size[1]},mark.lifted));
+         (void)arrangeMarks->update(marks,arrangeMarkRects,gpu::designLinearTint(designOverlay->context().env().palette.plateInk()));}
+-    if(nativeAppearance){watchAppearance.selectedAction=notes?contentCatalog->actionForTarget(core::moduleIdentifier(notes->selected())).value_or(0):0;nativeAppearance->update(session->actions(),watchAppearance,labels->placements());}
++    if(nativeAppearance){watchAppearance.selectedAction=notes?moduleAction(core::moduleIdentifier(notes->selected())).value_or(0):0;nativeAppearance->update(session->actions(),watchAppearance,labels->placements());}
+     // Chrome samples once per visible second; opacity follows the same
+     // ready/close timestamps as the source outer controller.
+     const auto frameChrome=chromeSettings(notes?notes->selected():core::Module::power);
+@@ -2718,15 +2719,18 @@ void Application::Impl::activate(const WatchActivation&event){
+         return;
+     }
+     if(event.action==closeAction){perform(lifecycle.close(),now());return;}
+-    const auto entries=contentCatalog->entries();const auto entry=std::find_if(entries.begin(),entries.end(),[&](const auto&value){return value.action==event.action;});
+-    // Saved app shortcuts bound between Power and Add App (close-first launch).
+-    if(entry==entries.end()){if(auto*apps=appNavigation()){bool launched{};(void)isolateService(appShortcutNavigationService,"app shortcut",[&]{launched=apps->activate(event.action,now());});if(launched)return;}}
+-    need(entry!=entries.end(),"Source activation exceeds exported actions");
++    std::string_view target;
++    if(const auto*entry=navigationEntry(event.action);entry&&entry->module)target=entry->target;
++    else for(const auto&exported:contentCatalog->entries())if(exported.action==event.action){target=exported.target;break;}
++    if(target.empty()){
++        if(auto*apps=appNavigation()){bool launched{};(void)isolateService(appShortcutNavigationService,"app shortcut",[&]{launched=apps->activate(event.action,now());});if(launched)return;}
++        need(false,"Source activation has no navigation entry");
++    }
+     // Mac 1.3.0: selecting Projection shows its centre page (ProjectionCanvas);
+     // the workspace opens from the page (openProjection, DOCS-600).
+-    if(notes){for(unsigned n=0;n<=static_cast<unsigned>(core::Module::profile);++n){const auto module=static_cast<core::Module>(n);if(core::moduleIdentifier(module)==entry->target){
+-        const auto effects=lifecycle.selectModule(module);if(effects.empty())selectModule(module,now());else perform(effects,now());break;}}}
+-    if(!production())std::cout<<"Source action: "<<entry->target<<'\n';
++    if(notes)if(const auto module=core::moduleNamed(target)){
++        const auto effects=lifecycle.selectModule(*module);if(effects.empty())selectModule(*module,now());else perform(effects,now());}
++    if(!production())std::cout<<"Source action: "<<target<<'\n';
+ }
+ 
+ // SystemHUDView.presentQuitConfirmation (Mac 1.3.0; HUDQuitConfirmationView
+@@ -2766,8 +2770,20 @@ void Application::Impl::bindNavigation(double time,bool animated){
+     navigationDirty=false;if(!nativeAppearance)return;
+     std::vector<gpu::WatchAppearanceEntry>entries;
+     for(const auto&e:contentCatalog->entries())entries.push_back({e.action,e.target,moduleCaption(e.target,watchAppearance.language,e.title),"module:"+e.target,true});
+-    // Display > Modules: the visible right-hand modules in their order (B2b).
+-    auto navigation=baseNavigation;navigation.rightActions=layoutRightActions(baseNavigation.rightActions);const auto right=navigation.rightActions;
++    auto navigation=baseNavigation;
++    navigation.rightActions=layoutRightActions(navigation.rightActions);
++    // The Windows page reuses the Calendar glyph in a recycled right-hand slot.
++    const auto conferenceID=core::moduleIdentifier(core::Module::conferenceDeadlines);
++    if(registry.presenter(core::Module::conferenceDeadlines)&&!contentCatalog->actionForTarget(conferenceID)){
++        const auto action=std::uint64_t(contentCatalog->entries().size())+1;
++        const auto power=contentCatalog->actionForTarget("power").value_or(0);
++        const auto add=contentCatalog->actionForTarget("addApp").value_or(0);
++        entries.push_back({action,std::string(conferenceID),moduleCaption(conferenceID,watchAppearance.language,conferenceID),"module:calendar",true});
++        auto position=std::find(navigation.rightActions.begin(),navigation.rightActions.end(),power);
++        if(position==navigation.rightActions.end())position=std::find(navigation.rightActions.begin(),navigation.rightActions.end(),add);
++        navigation.rightActions.insert(position,action);
++    }
++    const auto right=navigation.rightActions;
+     if(auto*apps=appNavigation()){
+         try{
+             const auto plan=apps->plan(entries,right);
+@@ -2944,7 +2960,7 @@ HudAutomationSource Application::Impl::automationSource(){
+     source.name=[this](const ModuleOwner&o){
+         // An owner that presents no module may name its group (powerCharge: Power).
+         if(const auto m=o.automationModule()){const auto id=core::moduleIdentifier(*m);return moduleCaption(id,watchAppearance.language,id);}
+-        for(unsigned n=0;n<=static_cast<unsigned>(core::Module::profile);++n){const auto module=static_cast<core::Module>(n);
++        for(unsigned n=0;n<core::moduleCount;++n){const auto module=static_cast<core::Module>(n);
+             if(o.presents(module)){const auto id=core::moduleIdentifier(module);return moduleCaption(id,watchAppearance.language,id);}}
+         return std::string("EndfieldHUD");};
+     return source;
+diff --git a/windows/app/application_verification.cpp b/windows/app/application_verification.cpp
+index 77f1164..1796b81 100644
+--- a/windows/app/application_verification.cpp
++++ b/windows/app/application_verification.cpp
+@@ -243,7 +243,7 @@ int Application::Impl::runMemoryTrace(){
+     recordMemory("first-opening",true);
+     // Every presented module, as a user visits them: one row of deltas each.
+     std::vector<core::Module> modules;
+-    for(unsigned n=0;n<=static_cast<unsigned>(core::Module::profile);++n){const auto module=static_cast<core::Module>(n);
++    for(unsigned n=0;n<core::moduleCount;++n){const auto module=static_cast<core::Module>(n);
+         if(auto*owner=registry.presenter(module);owner&&registry.enabled(*owner))modules.push_back(module);}
+     const auto sample=[&]{struct Sample{ProcessDiagnostics process;gpu::LayerRasterStats raster;gpu::RendererStats rendered;std::uint32_t pool;};return Sample{captureProcessDiagnostics(false),rasterizer.stats(),renderer.stats(),countPoolWorkers()};};
+     const auto gpuBytes=[](const ProcessDiagnostics&d){std::uint64_t sum{};for(const auto&a:d.adapters)sum+=a.localUsage+a.nonLocalUsage;return sum;};
+@@ -1267,7 +1267,7 @@ int Application::Impl::runHiddenVerification(){
+             std::vector modules{core::Module::notes,core::Module::fileShelf,core::Module::clipboard,core::Module::volume,core::Module::eventLog,core::Module::workMode,core::Module::power};if(archive)modules.push_back(core::Module::archive);if(storage)modules.push_back(core::Module::storage);if(activity)modules.push_back(core::Module::activityMonitor);if(reader)modules.push_back(core::Module::reader);if(calendar)modules.push_back(core::Module::calendar);if(map)modules.push_back(core::Module::map);if(!args.orbipomAssets.empty())modules.push_back(core::Module::minigame);if(settingsUI)modules.insert(modules.end(),{core::Module::system,core::Module::display,core::Module::hotkeys,core::Module::about});
+             // Every HUD module an area presents joins the same combined cycles.
+             std::vector<core::Module> areaModules;
+-            for(unsigned n=0;n<=static_cast<unsigned>(core::Module::profile);++n){const auto module=static_cast<core::Module>(n);
++            for(unsigned n=0;n<core::moduleCount;++n){const auto module=static_cast<core::Module>(n);
+                 if(std::find(modules.begin(),modules.end(),module)==modules.end()&&areaFor(registry.presenter(module))){areaModules.push_back(module);areaPresentedModules.push_back(std::string(core::moduleIdentifier(module)));}}
+             modules.insert(modules.end(),areaModules.begin(),areaModules.end());
+             std::optional<gpu::LayerRasterStats> retainedCycle;
+@@ -3152,7 +3152,7 @@ int Application::Impl::runHiddenVerification(){
+                 // so each one the HUD opens into plays the delayed opening entrance, Home (Power)
+                 // included: here every module a registered owner presents is a design screen.
+                 {std::string unmarked;
+-                 for(unsigned moduleIndex=0;moduleIndex<=static_cast<unsigned>(core::Module::profile);++moduleIndex){const auto presented=static_cast<core::Module>(moduleIndex);
++                 for(unsigned moduleIndex=0;moduleIndex<core::moduleCount;++moduleIndex){const auto presented=static_cast<core::Module>(moduleIndex);
+                      if(registry.presenter(presented)&&!notes->isDesignScreen(presented))unmarked+=" "+std::string(core::moduleIdentifier(presented));}
+                  need(registry.presenter(core::Module::power)&&notes->isDesignScreen(core::Module::power)&&unmarked.empty(),
+                      ("Every presented module is a design screen with an opening entrance, Home included (not:"+unmarked+")").c_str());++hostChecks;}
+@@ -3767,7 +3767,7 @@ int Application::Impl::runHiddenVerification(){
+             {"settingsLinkRequests",std::int64_t(linkRequests)},{"archiveIncluded",bool(archive)},{"storageIncluded",bool(storage)},{"activityIncluded",bool(activity)},{"readerIncluded",bool(reader)},{"calendarIncluded",bool(calendar)},{"calendarUsesSyntheticNotifications",bool(calendarFixture)},{"mapIncluded",bool(map)},{"minigameIncluded",bool(game)},{"storageUsesSyntheticProviders",bool(storageFixture)},{"storageCapacityReads",storageFixture?int(storageFixture->capacityReads.load()):0},{"storageDetailScans",storageFixture?int(storageFixture->detailScans.load()):0},{"storageSettingsRequests",storageFixture?int(storageFixture->settingsRequests):0},{"appSharedMediaProvider",bool(mediaBroker)},{"limitations",Json::Array{args.moduleCoverage?"Module owners use synthetic data and hidden generated input; real clipboard/audio providers and desktop backdrop are excluded":"No module bodies, providers, persistence, user input or screen capture; hidden offscreen benchmark excludes the system backdrop","Visible preview uses the native system backdrop with original source fade/default opacity; exact blur/radial appearance is unverified","Fixed synthetic clock strings; original canvas fade does not extend source clip completion","Native caption/icon variants are limited to exact exported action-slot pairs; missing variants reject instead of fabricating artwork","CPU timings include submission/driver stalls; no GPU completion timestamp or frame-rate claim","Forced stable-idle draws are benchmark samples; the actual host schedules no ambient-off idle frames"}}};
+         Json::Array areas;
+         for(const auto&area:externalModules){const auto&counts=areaCounts[area.name];Json::Array presents;
+-            for(unsigned n=0;n<=static_cast<unsigned>(core::Module::profile);++n)if(area.owner->presents(static_cast<core::Module>(n)))presents.push_back(std::string(core::moduleIdentifier(static_cast<core::Module>(n))));
++            for(unsigned n=0;n<core::moduleCount;++n)if(area.owner->presents(static_cast<core::Module>(n)))presents.push_back(std::string(core::moduleIdentifier(static_cast<core::Module>(n))));
+             areas.push_back(Json::Object{{"area",area.name},{"constructed",true},{"enabled",registry.enabled(*area.owner)},{"presents",std::move(presents)},{"coverageSteps",std::int64_t(counts.steps)},{"coverageChecks",std::int64_t(counts.checks)}});}
+         for(const auto&name:absentModules)areas.push_back(Json::Object{{"area",name},{"constructed",false}});
+         if(!contrastReport.isNull())report["moduleContrast"]=std::move(contrastReport);report["recordingToggle"]=std::move(recordingToggle);report["pageVisibility"]=std::move(pageVisibility);report["actionTiming"]=std::move(actionTiming);report["areaCoverage"]=std::move(areas);report["areaModuleResults"]=std::move(areaModuleResults);report["areaPresentedModules"]=std::move(areaPresentedModules);
+diff --git a/windows/core/data/data_store.cpp b/windows/core/data/data_store.cpp
+index 6c7276b..fba4d85 100644
+--- a/windows/core/data/data_store.cpp
++++ b/windows/core/data/data_store.cpp
+@@ -369,7 +369,7 @@ ModuleLayout ModuleLayout::normalized(std::vector<std::string> order,std::vector
+     return value;
+ }
+ bool ModuleLayout::isOpenable(std::string_view module) noexcept {return std::find(openable.begin(),openable.end(),module)!=openable.end();}
+-bool ModuleLayout::isModule(std::string_view module) noexcept {return module=="addApp"||isOpenable(module);}
++bool ModuleLayout::isModule(std::string_view module) noexcept {return module=="addApp"||module=="conferenceDeadlines"||isOpenable(module);}
+ std::vector<std::string> ModuleLayout::visible() const {std::vector<std::string> out;for(const auto& name:order) if(!contains(hidden,name)) out.push_back(name);return out;}
+ std::string ModuleLayout::restorable(std::string_view module) const {return isHidden(module)?visible().front():std::string(module);}
+ bool ModuleLayout::isDefault() const {return hidden.empty()&&std::equal(order.begin(),order.end(),configurable.begin(),configurable.end());}
+diff --git a/windows/core/data/data_store.hpp b/windows/core/data/data_store.hpp
+index 6b134a9..3985a56 100644
+--- a/windows/core/data/data_store.hpp
++++ b/windows/core/data/data_store.hpp
+@@ -37,7 +37,7 @@ std::string makeWindowsMediaReference(std::string path, std::string displayName,
+     std::optional<double> duration = {}, int frameCount = 1);
+ 
+ // Mac HUDModuleLayout (Sources/HUDNavigationTarget.swift:84-144): order and
+-// visibility of the 17 right-hand modules (Display > Modules), by HUDModule
++// visibility of the 17 configurable right-hand modules (Display > Modules), by HUDModule
+ // raw value. Every value is normalized like the Mac init: unknown and
+ // repeated names are dropped, configurable modules missing from the order are
+ // appended in default order (modules a later version adds), hidden is kept in
+@@ -56,12 +56,11 @@ struct ModuleLayout {
+     // HUDDesktopWatchNavigation.fixedModules (Sources/HUDNavigationTarget.swift:59):
+     // the modules outside Display > Modules, always in the navigation.
+     static constexpr std::array<std::string_view, 6> fixed{"system", "display", "hotkeys", "about", "storage", "activityMonitor"};
+-    // HUDOverlayLayout.openableModules: every module the navigation can open,
+-    // in navigation order (fixed, then configurable). Add App is an action,
+-    // never a place to open on.
++    // HUDOverlayLayout.openableModules: the pages offered by Display > Open on
++    // in navigation order (fixed, then configurable).
+     static constexpr auto openable = joinedModules(fixed, configurable);
+     static bool isOpenable(std::string_view module) noexcept;
+-    // A HUDModule raw value: an openable module or Add App.
++    // A module ID that can be persisted as the last opened page.
+     static bool isModule(std::string_view module) noexcept;
+     std::vector<std::string> order{configurable.begin(), configurable.end()}, hidden;
+     static ModuleLayout normalized(std::vector<std::string> order, std::vector<std::string> hidden);
+diff --git a/windows/core/module_presentation.hpp b/windows/core/module_presentation.hpp
+index fda2efb..8dcce32 100644
+--- a/windows/core/module_presentation.hpp
++++ b/windows/core/module_presentation.hpp
+@@ -197,7 +197,7 @@ private:
+     std::optional<Leave> leave_;              // On current_: a reversed switch's leave the close keeps, or leaveForClose.
+     std::optional<std::pair<Screen,Leave>> departing_;
+     Module notified_;                         // The destination of the last reported change.
+-    std::array<bool,24> design_{};
++    std::array<bool, moduleCount> design_{};
+     std::uint64_t nextIdentity_{1};
+     bool dark_{true},concealed_{};
+     void advance(double time);
+diff --git a/windows/core/motion.cpp b/windows/core/motion.cpp
+index bc234bd..0bf6189 100644
+--- a/windows/core/motion.cpp
++++ b/windows/core/motion.cpp
+@@ -48,6 +48,7 @@ ModuleGroup moduleGroup(Module module) {
+     case Module::workMode: case Module::eventLog: case Module::map: case Module::addApp:
+     case Module::nowPlaying: case Module::account: case Module::projection: case Module::reader:
+     case Module::archive: case Module::mediaAssembly: case Module::calendar: case Module::minigame:
++    case Module::conferenceDeadlines:
+         return ModuleGroup::right;
+     case Module::system: case Module::display: case Module::hotkeys: case Module::about:
+         return ModuleGroup::left;
+@@ -59,14 +60,15 @@ ModuleGroup moduleGroup(Module module) {
+     throw std::invalid_argument("Unknown module");
+ }
+ std::string_view moduleIdentifier(Module module) {
+-    constexpr std::array<std::string_view, 24> identifiers{
++    constexpr std::array<std::string_view, moduleCount> identifiers{
+         "notes", "fileShelf", "clipboard", "volume", "workMode", "eventLog", "map", "addApp",
+         "nowPlaying", "account", "projection", "reader", "archive", "mediaAssembly", "calendar", "minigame",
+-        "system", "display", "hotkeys", "about", "storage", "activityMonitor", "power", "profile"};
++        "system", "display", "hotkeys", "about", "storage", "activityMonitor", "power", "profile",
++        "conferenceDeadlines"};
+     return identifiers.at(static_cast<std::size_t>(module));
+ }
+ std::optional<Module> moduleNamed(std::string_view identifier) noexcept {
+-    for (unsigned n = 0; n <= static_cast<unsigned>(Module::profile); ++n)
++    for (unsigned n = 0; n < moduleCount; ++n)
+         if (moduleIdentifier(static_cast<Module>(n)) == identifier) return static_cast<Module>(n);
+     return std::nullopt;
+ }
+@@ -265,6 +267,7 @@ MotionPoint ShellPosition::position(Module module) {
+     case Module::reader: return {1490, 833};
+     case Module::workMode: return {1330, 945};
+     case Module::calendar: return {1440, 945};
++    case Module::conferenceDeadlines: return {1290, 1050};
+     case Module::map: return {1290, 1050};
+     case Module::eventLog: return {1400, 1050};
+     case Module::profile: return {540, 900};
+diff --git a/windows/core/motion.hpp b/windows/core/motion.hpp
+index 17e4aae..70971f6 100644
+--- a/windows/core/motion.hpp
++++ b/windows/core/motion.hpp
+@@ -8,13 +8,15 @@
+ 
+ namespace endfield::core {
+ 
+-// Keep this order equal to HUDModule.allCases: same-group transition direction
+-// uses declaration order, not navigation order or translated labels.
++// Keep the order of the Mac modules equal to HUDModule.allCases.
++// Same-group transition direction uses declaration order.
+ enum class Module {
+     notes, fileShelf, clipboard, volume, workMode, eventLog, map, addApp,
+     nowPlaying, account, projection, reader, archive, mediaAssembly, calendar, minigame,
+-    system, display, hotkeys, about, storage, activityMonitor, power, profile
++    system, display, hotkeys, about, storage, activityMonitor, power, profile,
++    conferenceDeadlines
+ };
++inline constexpr auto moduleCount = static_cast<unsigned>(Module::conferenceDeadlines) + 1;
+ enum class ModuleGroup { left, right, bottom, power };
+ struct MotionPoint { double x{}, y{}; bool operator==(const MotionPoint &) const = default; };
+ struct MotionRect { double x{}, y{}, width{}, height{}; };
+diff --git a/windows/modules/module_titles.cpp b/windows/modules/module_titles.cpp
+index 8bd3e1a..45baf46 100644
+--- a/windows/modules/module_titles.cpp
++++ b/windows/modules/module_titles.cpp
+@@ -5,14 +5,15 @@
+ namespace endfield::modules {
+ namespace {
+ struct Title {std::string_view id,english,simplifiedChinese;};
+-constexpr std::array<Title,24> titles{{
++constexpr std::array<Title,25> titles{{
+     {"notes","Notes","便笺"},{"fileShelf","Temporary File Shelf","文件暂存架"},{"clipboard","Clipboard Cache","剪贴板"},
+     {"volume","Volume","音量"},{"account","Account Linking","账户绑定"},{"nowPlaying","Now Playing","当前播放"},
+     {"projection","Projection","投影"},{"reader","E-Reader","阅读器"},{"archive","Archive","档案库"},
+     {"mediaAssembly","Media Assembly","影像加工"},{"calendar","Calendar","日历"},{"minigame","Closure's Minigame","可露希尔的小游戏"},
+     {"workMode","Work Mode","工作模式"},{"eventLog","Event Log","事件日志"},{"map","Map","地图"},{"addApp","+ Add App","+ 添加应用"},
+     {"system","System","系统"},{"display","Display","显示"},{"hotkeys","Hotkeys","快捷键"},{"about","About","关于"},
+-    {"storage","Storage","存储"},{"activityMonitor","Activity Monitor","活动监视器"},{"power","Power","电源"},{"profile","Personal Profile","个人名片"}}};
++    {"storage","Storage","存储"},{"activityMonitor","Activity Monitor","活动监视器"},{"power","Power","电源"},{"profile","Personal Profile","个人名片"},
++    {"conferenceDeadlines","Conference Deadlines","会议截稿"}}};
+ }
+ std::optional<std::string> moduleTitle(std::string_view rawValue,core::Language language){
+     for(const auto&t:titles)if(t.id==rawValue)return core::localized(t.english,t.simplifiedChinese,language);
+diff --git a/windows/tests/data_store_tests.cpp b/windows/tests/data_store_tests.cpp
+index 4701912..d6eeca1 100644
+--- a/windows/tests/data_store_tests.cpp
++++ b/windows/tests/data_store_tests.cpp
+@@ -578,6 +578,7 @@ void overlayLayout131(const std::function<void(const Json&)>& writeSettings, con
+           ModuleLayout::openable[6] == "notes" && ModuleLayout::openable.back() == "power" && !ModuleLayout::isOpenable("addApp") &&
+           ModuleLayout::isModule("addApp") && ModuleLayout::isOpenable("hotkeys") && !ModuleLayout::isModule("clock"),
+           "Openable modules: the fixed six, then the configurable list; Add App is a module but never openable");
++    check(ModuleLayout::isModule("conferenceDeadlines"), "The fixed Conference Deadlines tile can be remembered as the last page");
+     const L defaults;
+     check(Settings::defaults().overlayLayout() == defaults && defaults.isDefault() && !Settings::defaults().fields.contains("hudOverlayLayout") &&
+           defaults.shownTitle() == "ENDFIELDHUD" && defaults.shownSubtitle() == "SYSTEM INTERFACE" && !defaults.openModule &&
+diff --git a/windows/tests/motion_tests.cpp b/windows/tests/motion_tests.cpp
+index ceb44bb..e2e6747 100644
+--- a/windows/tests/motion_tests.cpp
++++ b/windows/tests/motion_tests.cpp
+@@ -75,7 +75,7 @@ void moduleGeometry() {
+           "Content frame is offset into the shared440x440 module viewport");
+     check(moduleIdentifier(Module::fileShelf) == "fileShelf" && moduleIdentifier(Module::activityMonitor) == "activityMonitor",
+           "Stable identifiers retain current Mac raw values");
+-    for (unsigned n = 0; n <= static_cast<unsigned>(Module::profile); ++n)
++    for (unsigned n = 0; n < moduleCount; ++n)
+         check(moduleNamed(moduleIdentifier(static_cast<Module>(n))) == static_cast<Module>(n), "Every raw value names its module");
+     check(!moduleNamed("teleporter") && !moduleNamed("") && !moduleNamed("Map"), "A name that is no raw value names no module");
+     auto direction = moduleDirection(Module::notes, Module::map);
+diff --git a/windows/app/areas/conference_deadlines_module.cpp b/windows/app/areas/conference_deadlines_module.cpp
+new file mode 100644
+index 0000000..fdc5b4b
+--- /dev/null
++++ b/windows/app/areas/conference_deadlines_module.cpp
+@@ -0,0 +1,119 @@
++#include "app/areas/conference_deadlines_module.hpp"
++
++#include "app/application.hpp"
++#include "app/application_host.hpp"
++#include "app/utility_executor.hpp"
++#include "modules/conference_deadlines.hpp"
++#include "packaging/update_platform.hpp"
++#include "tools/hud_design_owner.hpp"
++
++#include <windows.h>
++
++namespace endfield::areas {
++namespace {
++namespace http = packaging::updates;
++using modules::ConferenceDeadlinesCanvas;
++
++class ConferenceFeed {
++public:
++    ConferenceFeed(const app::ApplicationModuleContext& context, std::uint32_t message)
++        : executor_(*context.utility), route_(executor_.makeRoute()),
++          transport_(transportOptions(context, message)) {}
++
++    ~ConferenceFeed() { executor_.invalidate(route_); }
++
++    void fetch(ConferenceDeadlinesCanvas::Completion complete) {
++        http::TransportRequest request;
++        request.url = modules::conferenceFeedURL;
++        request.headers = {{"Accept", "application/json"}};
++        request.maximumBytes = modules::conferenceFeedMaximumBytes;
++        transport_.start(std::move(request), [this, complete = std::move(complete)](http::TransportResponse response) {
++            if (response.failure != http::TransportResponse::Failure::none || response.response.status != 200) {
++                complete(std::nullopt);
++                return;
++            }
++            auto result = std::make_shared<ConferenceDeadlinesCanvas::Deadlines>();
++            const auto accepted = executor_.submit(route_,
++                [result, body = std::move(response.response.body)] {
++                    *result = modules::decodeConferenceDeadlines(body);
++                },
++                [result, complete](std::exception_ptr error) {
++                    complete(error ? std::nullopt : std::move(*result));
++                });
++            if (!accepted) complete(std::nullopt);
++        });
++    }
++
++    void drain() { transport_.drain(); }
++    std::optional<double> nextDeadline() const { return transport_.nextDeadline(); }
++    bool deadline(double time) { return transport_.deadline(time); }
++
++private:
++    http::WinHttpTransport::Options transportOptions(const app::ApplicationModuleContext& context, std::uint32_t message) {
++        http::WinHttpTransport::Options options;
++        options.now = context.clock;
++        options.userAgent = L"EndfieldHUD-ConferenceDeadlines";
++        options.notify = [window = static_cast<HWND>(context.window), message] { PostMessageW(window, message, 0, 0); };
++        options.background = [this](auto work, auto done) {
++            return executor_.submit(route_, std::move(work), std::move(done));
++        };
++        return options;
++    }
++
++    app::UtilityExecutor& executor_;
++    app::UtilityExecutor::Route route_;
++    http::WinHttpTransport transport_;
++};
++
++modules::CalendarDay localToday() {
++    SYSTEMTIME local{};
++    GetLocalTime(&local);
++    return {local.wYear, local.wMonth, local.wDay};
++}
++}
++
++std::unique_ptr<app::ModuleOwner> conferenceDeadlinesModule(const app::ApplicationModuleContext& context) {
++    if (!context.host || !context.utility) return {};
++    auto& host = *context.host;
++    auto* design = host.designContext();
++    if (!design) return {};
++
++    app::ModuleRouting routing;
++    routing.pointer = 38;
++    routing.key = 38;
++    routing.message = 38;
++    tools::DesignOwnerOptions options;
++    if (!host.designOwnerOptions(options, "conferenceDeadlines", routing)) return {};
++
++    ConferenceDeadlinesCanvas::Fetch fetch;
++    std::function<modules::CalendarDay()> today;
++    if (context.mode == app::ApplicationAreaMode::production) {
++        const auto message = host.registerMessage();
++        const auto feed = std::make_shared<ConferenceFeed>(context, message);
++        fetch = [feed](auto completion) { feed->fetch(std::move(completion)); };
++        today = localToday;
++        options.message = [feed, message](const auto& input, double) {
++            if (input.message != message) return false;
++            feed->drain();
++            return true;
++        };
++        options.nextWakeTime = [feed](double) { return feed->nextDeadline(); };
++        options.deadline = [feed](double time) { return feed->deadline(time); };
++    } else {
++        today = [] { return modules::CalendarDay{2026, 11, 13}; };
++        fetch = [](auto complete) {
++            complete(modules::decodeConferenceDeadlines(R"([
++                {"name":"HUD 2026","full_name":"Human-centred User Design","deadline":"2026-11-18"},
++                {"name":"DI 2027","full_name":"Desktop Interfaces","deadline":"2026-12-03"}
++            ])"));
++        };
++    }
++
++    auto canvas = std::make_unique<ConferenceDeadlinesCanvas>(*design, std::move(fetch), std::move(today),
++        [&host] { host.openLinkAfterClose(std::string(modules::conferencePageURL)); }, options.changed);
++    auto core = std::make_unique<tools::DesignOwnerCore>(context.rasterizer, *design, std::move(options));
++    core->add(std::move(canvas));
++    return std::make_unique<tools::DesignModuleOwner>(std::move(core));
++}
++
++} // namespace endfield::areas
+diff --git a/windows/app/areas/conference_deadlines_module.hpp b/windows/app/areas/conference_deadlines_module.hpp
+new file mode 100644
+index 0000000..1c244ad
+--- /dev/null
++++ b/windows/app/areas/conference_deadlines_module.hpp
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include <memory>
++
++namespace endfield::app {
++class ModuleOwner;
++struct ApplicationModuleContext;
++}
++
++namespace endfield::areas {
++std::unique_ptr<app::ModuleOwner> conferenceDeadlinesModule(const app::ApplicationModuleContext&);
++}
+diff --git a/windows/cmake/modules/conference_deadlines.cmake b/windows/cmake/modules/conference_deadlines.cmake
+new file mode 100644
+index 0000000..5b5c8b6
+--- /dev/null
++++ b/windows/cmake/modules/conference_deadlines.cmake
+@@ -0,0 +1,17 @@
++add_library(hud_conference_deadlines modules/conference_deadlines.cpp)
++target_link_libraries(hud_conference_deadlines PUBLIC hud_calendar hud_design)
++
++if(WIN32)
++  add_library(hud_conference_deadlines_area STATIC app/areas/conference_deadlines_module.cpp)
++  target_compile_definitions(hud_conference_deadlines_area PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 UNICODE _UNICODE NOMINMAX)
++  target_link_libraries(hud_conference_deadlines_area PRIVATE
++    hud_conference_deadlines hud_design_native hud_packaging_update_platform hud_utility user32)
++  set_property(GLOBAL APPEND PROPERTY EHUD_APP_AREAS
++    "conferenceDeadlines|hud_conference_deadlines_area|app/areas/conference_deadlines_module.hpp|endfield::areas::conferenceDeadlinesModule")
++endif()
++
++if(BUILD_TESTING)
++  add_executable(conference_deadlines_tests tests/conference_deadlines_tests.cpp)
++  target_link_libraries(conference_deadlines_tests PRIVATE hud_conference_deadlines)
++  add_test(NAME conference_deadlines_contracts COMMAND conference_deadlines_tests)
++endif()
+diff --git a/windows/modules/conference_deadlines.cpp b/windows/modules/conference_deadlines.cpp
+new file mode 100644
+index 0000000..c8970d8
+--- /dev/null
++++ b/windows/modules/conference_deadlines.cpp
+@@ -0,0 +1,167 @@
++#include "modules/conference_deadlines.hpp"
++#include "modules/hud_design_badges.hpp"
++
++#include <algorithm>
++#include <array>
++#include <stdexcept>
++
++namespace endfield::modules {
++namespace d = design;
++namespace {
++constexpr std::size_t pageSize = 6;
++constexpr double rowHeight = 56;
++constexpr double rowPitch = 62;
++
++std::string displayField(const ehud::data::Json& item, std::string_view field, std::size_t limit) {
++    const auto& value = item[field];
++    if (!value.isString()) return {};
++    auto text = value.string();
++    if (text.size() > limit) return {};
++    for (char& c : text)
++        if (static_cast<unsigned char>(c) < 32) c = ' ';
++    const auto first = text.find_first_not_of(' ');
++    if (first == text.npos) return {};
++    return text.substr(first, text.find_last_not_of(' ') - first + 1);
++}
++}
++
++std::vector<ConferenceDeadline> decodeConferenceDeadlines(std::string_view body) {
++    const auto feed = ehud::data::Json::parse(body, conferenceFeedMaximumBytes);
++    if (!feed.isArray()) throw std::invalid_argument("Expected a conference array");
++    std::vector<ConferenceDeadline> deadlines;
++    bool hasDeadlineField = feed.array().empty();
++    for (const auto& item : feed.array()) {
++        if (!item["deadline"].isString()) continue;
++        hasDeadlineField = true;
++        const auto rawDate = displayField(item, "deadline", 10);
++        if (rawDate.size() != 10 || rawDate[4] != '-' || rawDate[7] != '-') continue;
++        const auto date = CalendarDay::parse(rawDate);
++        if (!date || date->string() != rawDate) continue;
++        auto name = displayField(item, "name", 256);
++        auto fullName = displayField(item, "full_name", 1024);
++        if (name.empty()) name = fullName;
++        if (!name.empty()) deadlines.push_back({*date, std::move(name), displayField(item, "year", 12), std::move(fullName)});
++    }
++    if (!hasDeadlineField) throw std::invalid_argument("Conference feed has no deadline fields");
++    std::stable_sort(deadlines.begin(), deadlines.end(), [](const auto& a, const auto& b) { return a.date < b.date; });
++    return deadlines;
++}
++
++ConferenceDeadlinesCanvas::ConferenceDeadlinesCanvas(d::Context& context, Fetch fetch,
++        std::function<CalendarDay()> today, std::function<void()> openSource, std::function<void()> changed)
++    : Canvas(core::Module::conferenceDeadlines, context), fetch_(std::move(fetch)), today_(std::move(today)),
++      openSource_(std::move(openSource)), changed_(std::move(changed)) {}
++
++void ConferenceDeadlinesCanvas::didActivate() {
++    if (!loading_ && now() >= refreshAfter_) refresh();
++    else if (shownDay_ != today_()) rerender();
++}
++
++void ConferenceDeadlinesCanvas::refresh() {
++    if (loading_) return;
++    loading_ = true;
++    failed_ = false;
++    rerender();
++    fetch_([this](Deadlines result) { finish(std::move(result)); });
++}
++
++void ConferenceDeadlinesCanvas::finish(Deadlines result) {
++    catchUpClock();
++    loading_ = false;
++    failed_ = !result;
++    refreshAfter_ = now() + (failed_ ? 60 : 15 * 60);
++    if (result) {
++        deadlines_ = std::move(*result);
++        loaded_ = true;
++        pageIndex_ = 0;
++    }
++    if (isShown()) rerender();
++    else deferRerender();
++    changed_();
++}
++
++void ConferenceDeadlinesCanvas::changePage(int step) {
++    if (step < 0 && pageIndex_ > 0) --pageIndex_;
++    else if (step > 0 && pageIndex_ + 1 < pageCount_) ++pageIndex_;
++    else return;
++    rerender();
++}
++
++void ConferenceDeadlinesCanvas::buildPage(d::Page& page) {
++    shownDay_ = today_();
++    const auto upcoming = std::lower_bound(deadlines_.begin(), deadlines_.end(), shownDay_,
++        [](const auto& entry, CalendarDay day) { return entry.date < day; });
++    const auto count = static_cast<std::size_t>(deadlines_.end() - upcoming);
++    pageCount_ = std::max<std::size_t>(1, (count + pageSize - 1) / pageSize);
++    pageIndex_ = std::min(pageIndex_, pageCount_ - 1);
++
++    auto& refreshButton = page.make<d::Button>("conferenceDeadlines.refresh", text("Refresh", "刷新"),
++        d::Icon::refresh, d::Button::Kind::secondary, d::Button::Height::compact);
++    refreshButton.place({0, 0});
++    refreshButton.setEnabled(!loading_);
++    refreshButton.onActivate = [this] { refresh(); };
++    auto& sourceButton = page.make<d::Button>("conferenceDeadlines.source", "Call4Papers",
++        d::Icon::ext, d::Button::Kind::secondary, d::Button::Height::compact);
++    sourceButton.place({0, 0});
++    sourceButton.onActivate = openSource_;
++    header().configure({text("Conferences", "学术会议")}, "", title("Conference Deadlines", "会议截稿"),
++        std::to_string(count), false, {&refreshButton, &sourceButton});
++
++    if (count == 0) {
++        const auto state = loading_ || (!loaded_ && !failed_) ? text("Loading deadlines", "正在加载截稿日期")
++            : failed_ ? text("Could not load deadlines", "无法加载截稿日期")
++                      : text("No upcoming deadlines", "暂无即将到来的截稿日期");
++        auto& empty = d::emptyState::make(page.builder(), "conferenceDeadlines.empty", state);
++        empty.setOrigin({0, d::metric::headerHeight});
++        page.layer().add(empty);
++        page.stagger(empty);
++        return;
++    }
++
++    const auto offset = pageIndex_ * pageSize;
++    for (std::size_t rowIndex = 0; rowIndex < std::min(pageSize, count - offset); ++rowIndex) {
++        const auto& entry = upcoming[offset + rowIndex];
++        auto name = entry.name;
++        if (!entry.year.empty() && !name.ends_with(entry.year)) name += " " + entry.year;
++        auto subtitle = entry.fullName.empty() || entry.fullName == entry.name ? std::nullopt : std::optional(entry.fullName);
++        auto& row = page.make<d::RowPlate>("conferenceDeadlines.row." + std::to_string(rowIndex), std::move(name),
++            std::move(subtitle), d::RowPlate::Variant::standard,
++            "", d::metric::boxWidth, rowHeight);
++        const auto date = entry.date.string();
++        auto& dateLabel = d::makeText(page.builder(), "conferenceDeadlines.date." + std::to_string(rowIndex), date,
++            d::TextStyle{.size = 15, .weight = d::FontWeight::medium, .color = env().palette.accentInk(), .tabular = true},
++            {0, 0, 108, 18}, d::TextAlignment::right);
++        row.setCluster({&dateLabel});
++        row.readout = date;
++        row.layer().setOrigin({0, d::metric::headerHeight + rowPitch * static_cast<double>(rowIndex)});
++        page.layer().add(row.layer());
++        page.add(row);
++        page.stagger(row.layer());
++    }
++
++    const auto pageNumber = std::to_string(pageIndex_ + 1);
++    const auto totalPages = std::to_string(pageCount_);
++    const std::array<std::string_view, 2> pages{pageNumber, totalPages};
++    auto footer = text("Page {0} of {1}", "第 {0} / {1} 页", pages);
++    if (loading_) footer += "   " + text("Refreshing", "正在刷新");
++    if (failed_) footer += "   " + text("Refresh failed", "刷新失败");
++    auto& status = d::makeText(page.builder(), "conferenceDeadlines.status", footer,
++        d::TextStyle{.size = 13, .color = env().palette.foreground(.75)}, {12, 473, 350, 20});
++    page.layer().add(status);
++
++    const auto addPageButton = [&](std::string id, std::string label, d::Icon icon, double x, bool enabled, int step) {
++        auto& button = page.make<d::Button>(std::move(id), std::move(label), icon,
++            d::Button::Kind::secondary, d::Button::Height::compact);
++        button.place({x, 469}, 104);
++        button.setEnabled(enabled);
++        button.onActivate = [this, step] { changePage(step); };
++        page.layer().add(button.layer());
++        page.add(button);
++    };
++    if (pageCount_ > 1) {
++        addPageButton("conferenceDeadlines.previous", text("Previous", "上一页"), d::Icon::prev, 374, pageIndex_ > 0, -1);
++        addPageButton("conferenceDeadlines.next", text("Next", "下一页"), d::Icon::next, 486, pageIndex_ + 1 < pageCount_, 1);
++    }
++}
++
++} // namespace endfield::modules
+diff --git a/windows/modules/conference_deadlines.hpp b/windows/modules/conference_deadlines.hpp
+new file mode 100644
+index 0000000..8d76454
+--- /dev/null
++++ b/windows/modules/conference_deadlines.hpp
+@@ -0,0 +1,50 @@
++#pragma once
++
++#include "modules/calendar_model.hpp"
++#include "modules/hud_design_page.hpp"
++
++namespace endfield::modules {
++
++inline constexpr std::string_view conferenceFeedURL = "https://call4papers.org/ccf.json";
++inline constexpr std::string_view conferencePageURL = "https://call4papers.org/deadlines";
++inline constexpr std::size_t conferenceFeedMaximumBytes = 8 * 1024 * 1024;
++
++struct ConferenceDeadline {
++    CalendarDay date;
++    std::string name;
++    std::string year;
++    std::string fullName;
++};
++
++// Dates in the feed are civil dates without a time zone or time of day.
++// Unknown and malformed dates are skipped, and equal dates keep feed order.
++std::vector<ConferenceDeadline> decodeConferenceDeadlines(std::string_view);
++
++class ConferenceDeadlinesCanvas final : public design::Canvas {
++public:
++    using Deadlines = std::optional<std::vector<ConferenceDeadline>>;
++    using Completion = std::function<void(Deadlines)>;
++    using Fetch = std::function<void(Completion)>;
++
++    ConferenceDeadlinesCanvas(design::Context&, Fetch, std::function<CalendarDay()> today,
++        std::function<void()> openSource, std::function<void()> changed);
++
++    void buildPage(design::Page&) override;
++    void didActivate() override;
++
++private:
++    void refresh();
++    void finish(Deadlines);
++    void changePage(int step);
++
++    Fetch fetch_;
++    std::function<CalendarDay()> today_;
++    std::function<void()> openSource_, changed_;
++    std::vector<ConferenceDeadline> deadlines_;
++    CalendarDay shownDay_;
++    std::size_t pageIndex_{}, pageCount_{1};
++    bool loading_{}, loaded_{}, failed_{};
++    double refreshAfter_{};
++};
++
++} // namespace endfield::modules
+diff --git a/windows/tests/conference_deadlines_tests.cpp b/windows/tests/conference_deadlines_tests.cpp
+new file mode 100644
+index 0000000..073a89f
+--- /dev/null
++++ b/windows/tests/conference_deadlines_tests.cpp
+@@ -0,0 +1,113 @@
++#include "modules/conference_deadlines.hpp"
++
++#include <algorithm>
++#include <fstream>
++#include <iostream>
++#include <iterator>
++#include <stdexcept>
++
++using namespace endfield::modules;
++namespace d = design;
++
++namespace {
++void check(bool condition, const char* message) {
++    if (!condition) throw std::runtime_error(message);
++}
++
++struct Measurer final : d::TextMeasurer {
++    double width(std::span<const d::TextRun> runs, d::TextRegion) override {
++        double width = 0;
++        for (const auto& run : runs) width += run.text.size() * run.style.size * .5;
++        return width;
++    }
++    d::LineMetrics metrics(const d::TextStyle& style, d::TextRegion, double scale) override {
++        const auto size = style.size * scale;
++        return {size * style.lineHeight, size * .8, size * .2};
++    }
++};
++
++void checkCanvas() {
++    Measurer measurer;
++    d::Context context(measurer, d::asciiUppercase);
++    ConferenceDeadlinesCanvas::Completion pending;
++    int requests{}, sourceVisits{};
++    auto today = CalendarDay{2026, 11, 13};
++    ConferenceDeadlinesCanvas canvas(context, [&](auto complete) { ++requests; pending = std::move(complete); },
++        [&] { return today; }, [&] { ++sourceVisits; }, [] {});
++    const auto rows = [&] {
++        std::vector<d::AccessibilityItem> items;
++        canvas.accessibilityItems(items);
++        std::erase_if(items, [](const auto& item) { return !item.id.starts_with("conferenceDeadlines.row."); });
++        return items;
++    };
++
++    canvas.show(1);
++    canvas.setActive(true, 1);
++    check(requests == 1 && rows().empty(), "Opening should request the feed once");
++    canvas.performAccessibilityAction("conferenceDeadlines.refresh", 1);
++    check(requests == 1, "Refresh should coalesce while loading");
++    std::vector<ConferenceDeadline> sample{{{2026, 11, 12}, "Expired", "", ""}};
++    for (int day = 13; day <= 19; ++day) sample.push_back({{2026, 11, day}, "Conference", "2026", "Full name"});
++    std::exchange(pending, {})(std::move(sample));
++    auto first = rows();
++    check(first.size() == 6 && first.front().label == "Conference 2026" && first.front().value == "2026-11-13",
++        "The first page should include today, exclude past dates and expose deadlines to accessibility");
++    check(canvas.performAccessibilityAction("conferenceDeadlines.next", 2), "Next page should be reachable");
++    auto second = rows();
++    check(second.size() == 1 && second.front().value == "2026-11-19", "The remaining deadline belongs on the next page");
++    check(canvas.performAccessibilityAction("conferenceDeadlines.previous", 3), "Previous page should be reachable");
++    check(rows() == first, "Previous page should restore the first six rows");
++    check(canvas.performAccessibilityAction("conferenceDeadlines.refresh", 4), "Manual refresh should be reachable");
++    check(requests == 2, "Manual refresh should start a new request");
++    std::exchange(pending, {})(std::nullopt);
++    check(rows() == first, "A failed refresh should keep the previous results");
++    check(canvas.performAccessibilityAction("conferenceDeadlines.source", 5) && sourceVisits == 1,
++        "The data source should be reachable");
++    canvas.setActive(false, 6);
++    today = {2026, 11, 14};
++    canvas.setActive(true, 7);
++    check(rows().front().value == "2026-11-14" && requests == 2, "Reopening should use the new local date and cached data");
++}
++}
++
++int main(int argc, char** argv) try {
++    const auto deadlines = decodeConferenceDeadlines(R"([
++        {"name":"Late","year":"2028","deadline":"2028-03-10"},
++        {"name":"Pending","deadline":"TBD"},
++        {"name":"Invalid leap day","deadline":"2026-02-29"},
++        {"name":"Timestamp","deadline":"2028-02-29T12:00:00Z"},
++        {"name":"  First\nConference  ","full_name":"Full name","deadline":"2028-02-29"},
++        {"name":"","full_name":"第二场会议","deadline":"2028-02-29"},
++        {"name":"Missing deadline"},
++        null
++    ])");
++    check(deadlines.size() == 3 && deadlines[0].date == CalendarDay{2028, 2, 29} &&
++        deadlines[0].name == "First Conference" && deadlines[0].fullName == "Full name" &&
++        deadlines[1].name == "第二场会议" && deadlines[2].name == "Late" && deadlines[2].year == "2028",
++        "Conference dates, labels or sort order differ");
++
++    if (!decodeConferenceDeadlines("[]").empty() ||
++        !decodeConferenceDeadlines(R"([{"name":"Pending","deadline":"TBD"}])").empty())
++        throw std::runtime_error("Empty and TBD-only feeds should have no dated rows");
++    for (const auto invalid : {"{}", "not JSON", R"([{"error":"unavailable"}])"}) {
++        try {
++            (void)decodeConferenceDeadlines(invalid);
++        } catch (const std::invalid_argument&) {
++            continue;
++        }
++        throw std::runtime_error("An invalid feed was accepted");
++    }
++    checkCanvas();
++    if (argc > 1) {
++        std::ifstream input(argv[1], std::ios::binary);
++        check(bool(input), "Could not open the downloaded conference feed");
++        const std::string body(std::istreambuf_iterator<char>{input}, {});
++        const auto live = decodeConferenceDeadlines(body);
++        check(!live.empty(), "The downloaded conference feed has no dated entries");
++        std::cout << live.size() << " dated records parsed from the downloaded feed\n";
++    }
++    return 0;
++} catch (const std::exception& error) {
++    std::cerr << error.what() << '\n';
++    return 1;
++}
