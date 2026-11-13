@@ -2,6 +2,8 @@
 
 「会议截稿」是 EndfieldHUD 的 Windows x64 源码补丁。它在 HUD 中央显示学术会议的论文截稿日期。EndfieldHUD 由 **DDDuoDuo** 创建。本补丁是独立维护的非官方扩展。[EndfieldHUD 原项目](https://github.com/DDDuoDuo/EndfieldHUD)
 
+![EndfieldHUD 的会议截稿页面，中央显示会议名称和截止日期](images/conference-deadlines.png)
+
 ## 使用方法
 
 1. 按下文安装，在新生成的 `out\bin` 目录双击 `EndfieldHUD.exe`。如果旧版正在运行，先从系统托盘退出。
